@@ -4,26 +4,29 @@ import { useReactMediaRecorder } from 'react-media-recorder';
 import './App.css';
 
 function App() {
-  // 1. Session State
+  // --- AUTHENTICATION STATE ---
+  const [authToken, setAuthToken] = useState(localStorage.getItem("token") || null);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [isLoginMode, setIsLoginMode] = useState(true);
+  const [authError, setAuthError] = useState(null);
+
+  // --- INTERVIEW STATE ---
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
   const [sessionData, setSessionData] = useState(null);
   const [error, setError] = useState(null);
   
-  // 2. Audio & NLP State
   const [audioResults, setAudioResults] = useState(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   
-  // 3. Code Execution State
   const [code, setCode] = useState("");
   const [codeResult, setCodeResult] = useState(null);
   const [isExecuting, setIsExecuting] = useState(false);
 
-  // 4. Gaze Tracking State
   const [engagement, setEngagement] = useState("Initializing...");
-  const engagementHistoryRef = useRef([]); // Secretly logs every frame's status
+  const engagementHistoryRef = useRef([]);
   
-  // 5. Final Report State
   const [isGeneratingReport, setIsGeneratingReport] = useState(false);
   const [reportData, setReportData] = useState(null);
 
@@ -31,13 +34,12 @@ function App() {
 
   // --- WEBSOCKET FOR GAZE TRACKING ---
   useEffect(() => {
-    if (!sessionData || reportData) return; // Stop tracking if interview hasn't started or is over
+    if (!sessionData || reportData) return;
 
     const ws = new WebSocket("ws://localhost:8000/ws/video-stream");
     let intervalId;
 
     ws.onopen = () => {
-      console.log("WebSocket connected");
       intervalId = setInterval(() => {
         if (webcamRef.current) {
           const imageSrc = webcamRef.current.getScreenshot();
@@ -49,19 +51,11 @@ function App() {
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
       setEngagement(data.engagement);
-      // Log the status for the final score calculation
       engagementHistoryRef.current.push(data.engagement);
     };
 
-    ws.onclose = () => {
-      console.log("WebSocket disconnected");
-      clearInterval(intervalId);
-    };
-
-    return () => {
-      clearInterval(intervalId);
-      ws.close();
-    };
+    ws.onclose = () => clearInterval(intervalId);
+    return () => { clearInterval(intervalId); ws.close(); };
   }, [sessionData, reportData]);
 
   // --- AUDIO RECORDING HOOK ---
@@ -75,10 +69,7 @@ function App() {
       formData.append("file", audioFile);
 
       try {
-        const response = await fetch("http://localhost:8000/api/analyze-audio/", {
-          method: "POST",
-          body: formData,
-        });
+        const response = await fetch("http://localhost:8000/api/analyze-audio/", {method: "POST", headers: { "Authorization": `Bearer ${authToken}` }, body: formData });
         const data = await response.json();
         setAudioResults(data);
       } catch (err) {
@@ -89,9 +80,37 @@ function App() {
     }
   });
 
-  // --- EVENT HANDLERS ---
-  const handleFileChange = (e) => { setFile(e.target.files[0]); setError(null); };
+  // --- AUTHENTICATION HANDLER ---
+  const handleAuthSubmit = async (e) => {
+    e.preventDefault();
+    setAuthError(null);
+    const endpoint = isLoginMode ? "/api/login/" : "/api/signup/";
+    
+    try {
+      const response = await fetch(`http://localhost:8000${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: authEmail, password: authPassword }),
+      });
+      const data = await response.json();
+      
+      if (!response.ok) throw new Error(data.detail || "Authentication failed");
+      
+      localStorage.setItem("token", data.access_token);
+      setAuthToken(data.access_token);
+    } catch (err) {
+      setAuthError(err.message);
+    }
+  };
 
+  const handleLogout = () => {
+    localStorage.removeItem("token");
+    setAuthToken(null);
+    setSessionData(null);
+    setReportData(null);
+  };
+
+  // --- INTERVIEW HANDLERS ---
   const handleUpload = async () => {
     if (!file) return;
     setLoading(true);
@@ -99,7 +118,7 @@ function App() {
     formData.append("file", file);
 
     try {
-      const response = await fetch("http://localhost:8000/api/upload-cv/", { method: "POST", body: formData });
+      const response = await fetch("http://localhost:8000/api/upload-cv/", { method: "POST", headers: { "Authorization": `Bearer ${authToken}` }, body: formData });
       const data = await response.json();
       setSessionData(data);
     } catch (err) {
@@ -115,7 +134,7 @@ function App() {
     try {
       const response = await fetch("http://localhost:8000/api/execute-code/", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${authToken}` }, 
         body: JSON.stringify({ code }),
       });
       const data = await response.json();
@@ -129,13 +148,10 @@ function App() {
 
   const handleEndInterview = async () => {
     setIsGeneratingReport(true);
-
-    // Calculate Engagement Score
     const history = engagementHistoryRef.current;
     const engagedFrames = history.filter(status => status === "Engaged").length;
     const engagementScore = history.length > 0 ? ((engagedFrames / history.length) * 100).toFixed(1) : 100.0;
 
-    // Aggregate all data to send to the LLM
     const payload = {
       question: sessionData.interview_questions,
       transcript: audioResults ? audioResults.transcript : "No verbal answer provided.",
@@ -148,18 +164,61 @@ function App() {
     try {
       const response = await fetch("http://localhost:8000/api/generate-report/", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${authToken}` },
         body: JSON.stringify(payload)
       });
       const data = await response.json();
       setReportData(data);
     } catch (err) {
-      console.error(err);
       alert("Error generating report.");
     } finally {
       setIsGeneratingReport(false);
     }
   };
+
+  // ==========================================
+  // VIEW 0: AUTHENTICATION SCREEN
+  // ==========================================
+  if (!authToken) {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', backgroundColor: '#f4f6f8', fontFamily: 'sans-serif' }}>
+        <div style={{ backgroundColor: 'white', padding: '40px', borderRadius: '12px', boxShadow: '0 4px 15px rgba(0,0,0,0.1)', width: '100%', maxWidth: '400px' }}>
+          <h1 style={{ textAlign: 'center', color: '#0d6efd', margin: '0 0 10px 0' }}>InterViewX</h1>
+          <p style={{ textAlign: 'center', color: '#666', marginBottom: '30px' }}>AI-Augmented Assessment Platform</p>
+          
+          <form onSubmit={handleAuthSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
+            <input 
+              type="email" 
+              placeholder="Email address" 
+              value={authEmail} 
+              onChange={(e) => setAuthEmail(e.target.value)} 
+              required
+              style={{ padding: '12px', borderRadius: '6px', border: '1px solid #ccc', fontSize: '16px' }}
+            />
+            <input 
+              type="password" 
+              placeholder="Password" 
+              value={authPassword} 
+              onChange={(e) => setAuthPassword(e.target.value)} 
+              required
+              style={{ padding: '12px', borderRadius: '6px', border: '1px solid #ccc', fontSize: '16px' }}
+            />
+            {authError && <p style={{ color: '#dc3545', fontSize: '14px', margin: 0 }}>{authError}</p>}
+            <button type="submit" style={{ padding: '14px', backgroundColor: '#0d6efd', color: 'white', border: 'none', borderRadius: '6px', fontSize: '16px', fontWeight: 'bold', cursor: 'pointer' }}>
+              {isLoginMode ? "Sign In" : "Create Account"}
+            </button>
+          </form>
+          
+          <p style={{ textAlign: 'center', marginTop: '20px', fontSize: '14px' }}>
+            {isLoginMode ? "Don't have an account? " : "Already have an account? "}
+            <span onClick={() => setIsLoginMode(!isLoginMode)} style={{ color: '#0d6efd', cursor: 'pointer', fontWeight: 'bold' }}>
+              {isLoginMode ? "Sign up" : "Log in"}
+            </span>
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   // ==========================================
   // VIEW 3: THE FINAL REPORT SCREEN
@@ -202,7 +261,7 @@ function App() {
             <p style={{ margin: 0, fontWeight: 'bold', color: '#333' }}>{evaluation.final_verdict}</p>
           </div>
           
-          <button onClick={() => window.location.reload()} style={{ display: 'block', width: '100%', padding: '15px', marginTop: '40px', backgroundColor: '#333', color: 'white', border: 'none', borderRadius: '8px', fontSize: '16px', cursor: 'pointer' }}>
+          <button onClick={() => { setReportData(null); setSessionData(null); }} style={{ display: 'block', width: '100%', padding: '15px', marginTop: '40px', backgroundColor: '#333', color: 'white', border: 'none', borderRadius: '8px', fontSize: '16px', cursor: 'pointer' }}>
             Start New Session
           </button>
         </div>
@@ -216,10 +275,13 @@ function App() {
   if (!sessionData) {
     return (
       <div style={{ padding: '50px', fontFamily: 'sans-serif', textAlign: 'center' }}>
-        <h1>InterViewX</h1>
-        <div style={{ margin: '40px auto', padding: '30px', maxWidth: '500px', border: '1px solid #e0e0e0', borderRadius: '12px', boxShadow: '0 4px 6px rgba(0,0,0,0.1)' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '40px' }}>
+          <h1 style={{ margin: 0, color: '#0d6efd' }}>InterViewX</h1>
+          <button onClick={handleLogout} style={{ padding: '8px 16px', backgroundColor: '#dc3545', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer' }}>Log Out</button>
+        </div>
+        <div style={{ margin: '0 auto', padding: '30px', maxWidth: '500px', border: '1px solid #e0e0e0', borderRadius: '12px', boxShadow: '0 4px 6px rgba(0,0,0,0.1)' }}>
           <h3>Upload your CV to begin</h3>
-          <input type="file" accept=".pdf" onChange={handleFileChange} style={{ margin: '20px 0' }} />
+          <input type="file" accept=".pdf" onChange={(e) => setFile(e.target.files[0])} style={{ margin: '20px 0' }} />
           <br />
           <button onClick={handleUpload} disabled={loading} style={{ padding: '12px 24px', backgroundColor: '#0d6efd', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '16px' }}>
             {loading ? "Generating Session..." : "Initialize Sandbox & Start Interview"}

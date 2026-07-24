@@ -16,8 +16,13 @@ import mediapipe as mp
 import numpy as np
 import base64
 import json
+from sqlalchemy.orm import Session
+from fastapi import Depends
+from . import database, models, auth
 
 app = FastAPI(title="InterViewX API")
+
+models.Base.metadata.create_all(bind=database.engine)
 
 # Add CORS middleware
 app.add_middleware(
@@ -52,6 +57,14 @@ class InterviewSessionData(BaseModel):
     filler_words: int
     engagement_score: float # Percentage of time engaged
 
+class UserCredentials(BaseModel):
+    email: str
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+
 # Connect to your local LM Studio instance
 # host.docker.internal allows the Docker container to talk to your Windows host machine
 llm_client = AsyncOpenAI(
@@ -78,7 +91,7 @@ def read_root():
     return {"message": "InterViewX Backend is up and running!"}
 
 @app.post("/api/upload-cv/")
-async def upload_cv(file: UploadFile = File(...)):
+async def upload_cv(file: UploadFile = File(...), current_user: models.User = Depends(auth.get_current_user)):
 
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
@@ -136,7 +149,7 @@ async def upload_cv(file: UploadFile = File(...)):
 
 
 @app.post("/api/analyze-audio/")
-async def analyze_audio(file: UploadFile = File(...)):
+async def analyze_audio(file: UploadFile = File(...), current_user: models.User = Depends(auth.get_current_user)):
     try:
         # Save the incoming audio chunk to a temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_audio:
@@ -163,7 +176,7 @@ async def analyze_audio(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")
 
 @app.post("/api/execute-code/")
-async def execute_code(submission: CodeSubmission):
+async def execute_code(submission: CodeSubmission, current_user: models.User = Depends(auth.get_current_user)):
     try:
         start_time = time.time()
 
@@ -197,39 +210,6 @@ async def execute_code(submission: CodeSubmission):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sandbox error: {str(e)}")
-
-
-    await websocket.accept()
-    try:
-        while True:
-            # 1. Receive the video frame as a base64 string from React
-            data = await websocket.receive_text()
-
-            # 2. Decode the image
-            header, encoded = data.split(",", 1)
-            img_bytes = base64.b64decode(encoded)
-            np_arr = np.frombuffer(img_bytes, np.uint8)
-            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-            # 3. Process with MediaPipe
-            # Convert the BGR image to RGB before processing
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            results = face_mesh.process(img_rgb)
-
-            engagement_status = "Looking Away"
-
-            if results.multi_face_landmarks:
-                # If a face is detected, we assume basic engagement for now.
-                # Later we can add precise iris tracking math here.
-                engagement_status = "Engaged"
-
-            # 4. Send the result back to the frontend instantly
-            await websocket.send_json({"engagement": engagement_status})
-
-    except WebSocketDisconnect:
-        print("Client disconnected from video stream.")
-    except Exception as e:
-        print(f"Video processing error: {e}")
 
 @app.websocket("/ws/video-stream")
 async def video_stream(websocket: WebSocket):
@@ -299,7 +279,7 @@ async def video_stream(websocket: WebSocket):
         print(f"Video processing error: {e}")
 
 @app.post("/api/generate-report/")
-async def generate_final_report(data: InterviewSessionData):
+async def generate_final_report(data: InterviewSessionData, current_user: models.User = Depends(auth.get_current_user)):
     try:
         system_prompt = """
         You are a senior technical interviewer. You have just completed an interview with a candidate. 
@@ -355,6 +335,40 @@ async def generate_final_report(data: InterviewSessionData):
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+# --- AUTHENTICATION ENDPOINTS ---
+
+@app.post("/api/signup/", response_model=TokenResponse)
+async def signup(user: UserCredentials, db: Session = Depends(database.get_db)):
+    # 1. Check if the email already exists
+    db_user = db.query(models.User).filter(models.User.email == user.email).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email is already registered")
+    
+    # 2. Hash the password and save the new user
+    hashed_pwd = auth.get_password_hash(user.password)
+    new_user = models.User(email=user.email, hashed_password=hashed_pwd)
+    
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    # 3. Generate their login token
+    access_token = auth.create_access_token(data={"sub": new_user.email})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/api/login/", response_model=TokenResponse)
+async def login(user: UserCredentials, db: Session = Depends(database.get_db)):
+    # 1. Find the user by email
+    db_user = db.query(models.User).filter(models.User.email == user.email).first()
+    
+    # 2. Verify user exists AND password is correct
+    if not db_user or not auth.verify_password(user.password, db_user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    # 3. Generate a fresh login token
+    access_token = auth.create_access_token(data={"sub": db_user.email})
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
 
