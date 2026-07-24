@@ -15,6 +15,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import base64
+import json
 
 app = FastAPI(title="InterViewX API")
 
@@ -41,6 +42,15 @@ docker_client = docker.from_env()
 # Data model for incoming code
 class CodeSubmission(BaseModel):
     code: str
+
+# Data model for the final evaluation
+class InterviewSessionData(BaseModel):
+    question: str
+    transcript: str
+    code: str
+    code_output: str
+    filler_words: int
+    engagement_score: float # Percentage of time engaged
 
 # Connect to your local LM Studio instance
 # host.docker.internal allows the Docker container to talk to your Windows host machine
@@ -288,6 +298,63 @@ async def video_stream(websocket: WebSocket):
     except Exception as e:
         print(f"Video processing error: {e}")
 
+@app.post("/api/generate-report/")
+async def generate_final_report(data: InterviewSessionData):
+    try:
+        system_prompt = """
+        You are a senior technical interviewer. You have just completed an interview with a candidate. 
+        Evaluate their performance based on the question asked, their verbal explanation, and the code they wrote.
+        Provide a structured evaluation in JSON format with the following keys:
+        - "technical_accuracy": Evaluate if the code works and solves the problem (1-3 sentences).
+        - "communication_skills": Evaluate their verbal explanation and clarity (1-3 sentences).
+        - "areas_for_improvement": Specific feedback on what they could do better.
+        - "final_verdict": A short concluding thought on their overall performance.
+        """
+
+        user_prompt = f"""
+        Interview Data:
+        - Question Asked: {data.question}
+        - Candidate's Verbal Answer: {data.transcript}
+        - Candidate's Code: {data.code}
+        - Code Execution Output: {data.code_output}
+        - Filler Words Used: {data.filler_words}
+        - Visual Engagement Score: {data.engagement_score}%
+        
+        Analyze this data and return the JSON evaluation.
+        """
+
+        response = await llm_client.chat.completions.create(
+            model="local-model",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3
+            # Removed the response_format flag that was crashing the local server
+        )
+
+        raw_content = response.choices[0].message.content.strip()
+        
+        # Safety net: Local LLMs sometimes wrap JSON in markdown blocks (```json ... ```)
+        if raw_content.startswith("```json"):
+            raw_content = raw_content[7:-3].strip()
+        elif raw_content.startswith("```"):
+            raw_content = raw_content[3:-3].strip()
+
+        # Parse the cleaned string into a Python dictionary
+        llm_feedback = json.loads(raw_content)
+
+        return {
+            "status": "success",
+            "metrics": {
+                "filler_words": data.filler_words,
+                "engagement_score": data.engagement_score
+            },
+            "llm_evaluation": llm_feedback
+        }
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 
