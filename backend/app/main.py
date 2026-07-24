@@ -188,8 +188,7 @@ async def execute_code(submission: CodeSubmission):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sandbox error: {str(e)}")
 
-@app.websocket("/ws/video-stream")
-async def video_stream(websocket: WebSocket):
+
     await websocket.accept()
     try:
         while True:
@@ -222,7 +221,72 @@ async def video_stream(websocket: WebSocket):
     except Exception as e:
         print(f"Video processing error: {e}")
 
-
+@app.websocket("/ws/video-stream")
+async def video_stream(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            # 1. Receive and decode the video frame
+            data = await websocket.receive_text()
+            header, encoded = data.split(",", 1)
+            img_bytes = base64.b64decode(encoded)
+            np_arr = np.frombuffer(img_bytes, np.uint8)
+            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            
+            # 2. Process with MediaPipe
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = face_mesh.process(img_rgb)
+            
+            engagement_status = "No Face Detected"
+            
+            if results.multi_face_landmarks:
+                # Grab the specific 3D coordinates for the first face detected
+                landmarks = results.multi_face_landmarks[0].landmark
+                
+                # --- GAZE TRACKING MATH ---
+                # Horizontal (X-axis) Landmarks
+                eye_outer_x = landmarks[33].x
+                eye_inner_x = landmarks[133].x
+                iris_x = landmarks[468].x
+                
+                # Vertical (Y-axis) Landmarks (Note: Y=0 is the top of the image)
+                eye_top_y = landmarks[159].y
+                eye_bottom_y = landmarks[145].y
+                iris_y = landmarks[468].y
+                
+                # Calculate Horizontal width
+                left_bound = min(eye_outer_x, eye_inner_x)
+                right_bound = max(eye_outer_x, eye_inner_x)
+                eye_width = right_bound - left_bound
+                
+                # Calculate Vertical height
+                eye_height = eye_bottom_y - eye_top_y
+                
+                if eye_width > 0 and eye_height > 0:
+                    # Calculate where the iris sits (0.0 to 1.0)
+                    iris_h_ratio = (iris_x - left_bound) / eye_width
+                    iris_v_ratio = (iris_y - eye_top_y) / eye_height
+                    
+                    # Create a "Safe Box" in the center of the eye
+                    # Horizontal safe zone: 35% to 65%
+                    # Vertical safe zone: 30% to 75% (eyelids naturally cover the top of the iris, so the math is slightly shifted)
+                    is_horizontally_engaged = 0.35 < iris_h_ratio < 0.65
+                    is_vertically_engaged = 0.30 < iris_v_ratio < 0.75
+                    
+                    if is_horizontally_engaged and is_vertically_engaged:
+                        engagement_status = "Engaged"
+                    else:
+                        engagement_status = "Looking Away"
+                else:
+                    engagement_status = "Engaged" # Fallback if math errors out
+            
+            # 4. Send the result back to the frontend instantly
+            await websocket.send_json({"engagement": engagement_status})
+            
+    except WebSocketDisconnect:
+        print("Client disconnected from video stream.")
+    except Exception as e:
+        print(f"Video processing error: {e}")
 
 
 
